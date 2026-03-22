@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HRM Release Metrics</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'IBM Plex Sans',sans-serif;background:#f8fafc;min-height:100vh;}
+::-webkit-scrollbar{height:6px;width:6px;}
+::-webkit-scrollbar-track{background:#f1f5f9;}
+::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px;}
+button,input,select{font-family:inherit;}
+input[type=number]::-webkit-inner-spin-button{opacity:.5;}
+.inp{width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s;}
+.inp:focus{border-color:#3b82f6;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef } = React;
+
+// ─── constants ────────────────────────────────────────────────────────────────
+const RELEASED_STATUSES = ["релиз", "принята"];
+function isReleased(s){ return RELEASED_STATUSES.includes((s||"").trim().toLowerCase()); }
+
+function parseDMY(str){
+  if(!str) return null;
+  const p = str.trim().split(".");
+  if(p.length!==3) return null;
+  const d = new Date(+p[2], +p[1]-1, +p[0]);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function parseRedmineCSV(text){
+  const clean = text.replace(/^\uFEFF/,"");
+  const lines = clean.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return { error:"Файл пустой или содержит только заголовок" };
+  const delim = lines[0].includes(";") ? ";" : ",";
+  function splitLine(line){
+    const res=[]; let cur="", inQ=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){inQ=!inQ;}
+      else if(ch===delim&&!inQ){res.push(cur.trim().replace(/^"|"$/g,"")); cur="";}
+      else{cur+=ch;}
+    }
+    res.push(cur.trim().replace(/^"|"$/g,""));
+    return res;
+  }
+  const headers = splitLine(lines[0]);
+  function findCol(...names){
+    for(const n of names){
+      const idx=headers.findIndex(h=>h.trim().toLowerCase()===n.toLowerCase());
+      if(idx!==-1) return idx;
+    }
+    return -1;
+  }
+  const iStatus  = findCol("статус","status");
+  const iCat     = findCol("категория","category");
+  const iStart   = findCol("дата начала","дата создания","created","start date");
+  const iRelease = findCol("дата релиза","дата закрытия","closed","release date");
+  if(iStatus===-1) return { error:`Не найден столбец «Статус». Найденные столбцы: ${headers.join(", ")}` };
+  const tasks=[];
+  for(let i=1;i<lines.length;i++){
+    const cols=splitLine(lines[i]);
+    if(cols.length<2) continue;
+    tasks.push({
+      status:      cols[iStatus]||"",
+      category:    iCat>=0?(cols[iCat]||"").trim():"",
+      dateStart:   iStart>=0?cols[iStart]:"",
+      dateRelease: iRelease>=0?cols[iRelease]:"",
+    });
+  }
+  if(!tasks.length) return { error:"Задачи не найдены" };
+  const releasedTasks = tasks.filter(t=>isReleased(t.status));
+  const leadTimes = releasedTasks.map(t=>{
+    const d1=parseDMY(t.dateStart), d2=parseDMY(t.dateRelease);
+    if(!d1||!d2) return null;
+    return Math.round((d2-d1)/86400000);
+  }).filter(v=>v!==null&&v>=0);
+  const avgLeadTime = leadTimes.length ? Math.round(leadTimes.reduce((s,v)=>s+v,0)/leadTimes.length) : null;
+  const catMap={};
+  tasks.forEach(t=>{ const c=t.category||"Без категории"; if(!catMap[c]) catMap[c]={total:0,released:0}; catMap[c].total++; });
+  releasedTasks.forEach(t=>{ const c=t.category||"Без категории"; if(catMap[c]) catMap[c].released++; });
+  return { tasks, planned:tasks.length, released:releasedTasks.length, velocity:releasedTasks.length,
+    leadTime:avgLeadTime, catMap, hasLeadTime:leadTimes.length>0, hasCat:iCat>=0 };
+}
+
+// ─── targets & metric defs ────────────────────────────────────────────────────
+const TARGETS = {
+  conversion:     {min:70, max:90},
+  leadTime:       {max:14},
+  velocity:       {min:5,  max:15},
+  monthToRelease: {min:50, max:70},
+  monthConv:      {min:70, max:90},
+  monthLeadTime:  {max:14},
+};
+
+const RELEASE_METRICS = [
+  {key:"conversion",    label:"Конверсия план→релиз", suffix:"%", hint:"70–90%"},
+  {key:"leadTime",      label:"Lead Time",             suffix:"д", hint:"< 14д"},
+  {key:"velocity",      label:"Velocity",              suffix:"",  hint:"5–15"},
+  {key:"monthToRelease",label:"Месяц→Релиз",           suffix:"%", hint:"50–70%"},
+];
+
+const MONTH_METRICS = [
+  {key:"monthConv",     label:"Конверсия месяц→релиз", suffix:"%", hint:"70–90%"},
+  {key:"monthLeadTime", label:"Lead Time (месяц)",      suffix:"д", hint:"< 14д"},
+  {key:"monthVelocity", label:"Выпущено за месяц",      suffix:"",  hint:""},
+  {key:"monthCoverage", label:"Охват бэклога",          suffix:"%", hint:"50–70%"},
+];
+
+// ─── sample data ──────────────────────────────────────────────────────────────
+const INITIAL_RELEASES = [
+  {id:1,release:"v08.02.2026",date:"2026-02-21",planned:11,released:8, leadTime:11,velocity:8, monthPlanned:38,catMap:{},monthId:null},
+  {id:2,release:"v14.02.2026",date:"2026-02-28",planned:13,released:10,leadTime:13,velocity:10,monthPlanned:38,catMap:{},monthId:null},
+  {id:3,release:"v07.03.2026",date:"2026-03-07",planned:12,released:9, leadTime:9, velocity:9, monthPlanned:40,catMap:{},monthId:1},
+  {id:4,release:"v14.03.2026",date:"2026-03-14",planned:10,released:11,leadTime:16,velocity:11,monthPlanned:40,catMap:{},monthId:1},
+  {id:5,release:"v19.03.2026",date:"2026-03-19",planned:14,released:7, leadTime:12,velocity:7, monthPlanned:40,catMap:{},monthId:1},
+];
+
+const INITIAL_MONTHS = [
+  {id:1, label:"Март 2026", planned:68, catMap:{}},
+];
+
+const pct=(a,b)=>b>0?Math.round((a/b)*100):0;
+
+function computeRelease(r){
+  return {...r, conversion:pct(r.released,r.planned), monthToRelease:pct(r.released,r.monthPlanned)};
+}
+
+function computeMonth(m, releases){
+  const linked = releases.filter(r=>r.monthId===m.id);
+  const totalReleased = linked.reduce((s,r)=>s+(r.released||0),0);
+  const allLeadTimes  = linked.map(r=>r.leadTime).filter(v=>v!==null&&v!==undefined);
+  const avgLT = allLeadTimes.length ? Math.round(allLeadTimes.reduce((s,v)=>s+v,0)/allLeadTimes.length) : null;
+
+  // merge catMaps from all linked releases
+  const catMap={};
+  linked.forEach(r=>{
+    if(!r.catMap) return;
+    Object.entries(r.catMap).forEach(([cat,v])=>{
+      if(!catMap[cat]) catMap[cat]={total:0,released:0};
+      catMap[cat].total    += v.total    ||0;
+      catMap[cat].released += v.released ||0;
+    });
+  });
+  // also add month-level catMap (from month CSV)
+  if(m.catMap){
+    Object.entries(m.catMap).forEach(([cat,v])=>{
+      if(!catMap[cat]) catMap[cat]={total:0,released:0};
+      // month catMap has planned totals; released come from releases
+    });
+  }
+
+  return {
+    ...m,
+    totalReleased,
+    monthConv:     pct(totalReleased, m.planned),
+    monthLeadTime: avgLT,
+    monthVelocity: totalReleased,
+    monthCoverage: pct(totalReleased, m.planned),
+    releases:      linked,
+    catMap,
+  };
+}
+
+// ─── status colours ───────────────────────────────────────────────────────────
+function getStatus(val, key){
+  const t=TARGETS[key];
+  if(!t||val===null||val===undefined) return "neutral";
+  if(t.min!==undefined&&t.max!==undefined){
+    if(val>=t.min&&val<=t.max) return "ok";
+    return (val<t.min-10||val>t.max+10)?"bad":"warn";
+  }
+  if(t.max!==undefined) return val<=t.max?"ok":(val>t.max*1.5?"bad":"warn");
+  if(t.min!==undefined) return val>=t.min?"ok":(val<t.min*0.7?"bad":"warn");
+  return "ok";
+}
+const SC={
+  ok:     {bg:"#d1fae5",text:"#065f46",border:"#6ee7b7",dot:"#10b981"},
+  warn:   {bg:"#fef9c3",text:"#854d0e",border:"#fde047",dot:"#f59e0b"},
+  bad:    {bg:"#fee2e2",text:"#991b1b",border:"#fca5a5",dot:"#ef4444"},
+  neutral:{bg:"#f1f5f9",text:"#475569",border:"#cbd5e1",dot:"#94a3b8"},
+};
+
+// ─── ui atoms ────────────────────────────────────────────────────────────────
+function Badge({val, metricKey, suffix}){
+  const s=getStatus(val,metricKey); const c=SC[s];
+  return <span style={{display:"inline-block",padding:"3px 11px",borderRadius:20,fontSize:12,
+    fontWeight:600,fontFamily:"'IBM Plex Mono',monospace",
+    background:c.bg,color:c.text,border:`1px solid ${c.border}`,minWidth:52,textAlign:"center"}}>
+    {val!==null&&val!==undefined?`${val}${suffix}`:"—"}
+  </span>;
+}
+
+function Sparkline({values, metricKey}){
+  const clean=values.filter(v=>v!==null&&v!==undefined);
+  if(clean.length<2) return null;
+  const w=72,h=26,p=3;
+  const mn=Math.min(...clean),mx=Math.max(...clean),range=mx-mn||1;
+  const pts=clean.map((v,i)=>[p+(i/(clean.length-1))*(w-p*2),p+(1-(v-mn)/range)*(h-p*2)]);
+  const d=pts.map((pt,i)=>`${i===0?"M":"L"}${pt[0].toFixed(1)},${pt[1].toFixed(1)}`).join(" ");
+  const last=pts[pts.length-1];
+  const col=SC[getStatus(clean[clean.length-1],metricKey)].dot;
+  return <svg width={w} height={h} style={{display:"block"}}>
+    <path d={d} fill="none" stroke={col} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"/>
+    <circle cx={last[0]} cy={last[1]} r={2.8} fill={col}/>
+  </svg>;
+}
+
+const MOD_COLORS=["#3b82f6","#10b981","#f59e0b","#8b5cf6","#ef4444","#06b6d4","#ec4899","#84cc16","#f97316","#6366f1"];
+const modColor=i=>MOD_COLORS[i%MOD_COLORS.length];
+
+// ─── file drop zone ───────────────────────────────────────────────────────────
+function DropZone({onFile, label}){
+  const ref=useRef();
+  return <div onClick={()=>ref.current.click()}
+    onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor="#3b82f6";}}
+    onDragLeave={e=>{e.currentTarget.style.borderColor="#93c5fd";}}
+    onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor="#93c5fd";
+      const f=e.dataTransfer.files[0]; if(f) onFile(f);}}
+    style={{border:"2px dashed #93c5fd",borderRadius:12,padding:"22px 20px",
+      textAlign:"center",background:"#f0f7ff",cursor:"pointer",marginBottom:12}}>
+    <div style={{fontSize:24,marginBottom:6}}>📂</div>
+    <div style={{fontSize:13,fontWeight:600,color:"#1e40af",marginBottom:3}}>{label}</div>
+    <div style={{fontSize:11,color:"#64748b"}}>CSV из Redmine · разделитель ; · UTF-8</div>
+    <input ref={ref} type="file" accept=".csv,.txt"
+      onChange={e=>{const f=e.target.files[0];if(f) onFile(f);e.target.value="";}}
+      style={{display:"none"}}/>
+  </div>;
+}
+
+function readFile(file, cb){
+  const r=new FileReader();
+  r.onload=e=>cb(e.target.result);
+  r.readAsText(file,"UTF-8");
+}
+
+// ─── modules panel ────────────────────────────────────────────────────────────
+function ModulesPanel({catMap, title, subtitle}){
+  const sorted=Object.entries(catMap).sort((a,b)=>b[1].total-a[1].total);
+  if(!sorted.length) return <div style={{color:"#94a3b8",fontSize:13,padding:"12px 0"}}>Нет данных по модулям</div>;
+  const grandTotal=sorted.reduce((s,[,v])=>s+v.total,0);
+  return <div>
+    <div style={{display:"grid",
+      gridTemplateColumns:"1fr 70px 70px 70px",
+      gap:8,padding:"6px 10px",background:"#f1f5f9",borderRadius:8,marginBottom:8,
+      fontSize:11,fontWeight:600,color:"#64748b"}}>
+      <span>{title||"Модуль (категория)"}</span>
+      <span style={{textAlign:"center"}}>Всего</span>
+      <span style={{textAlign:"center"}}>В релиз</span>
+      <span style={{textAlign:"center"}}>% от всех</span>
+    </div>
+    {sorted.map(([cat,vals],idx)=>{
+      const conv=pct(vals.released,vals.total);
+      const share=grandTotal>0?Math.round((vals.total/grandTotal)*100):0;
+      const col=modColor(idx);
+      return <div key={cat} style={{display:"grid",
+        gridTemplateColumns:"1fr 70px 70px 70px",
+        gap:8,padding:"8px 10px",alignItems:"center",
+        borderBottom:"1px solid #f1f5f9"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+          <span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:col,flexShrink:0}}/>
+          <span style={{fontSize:13,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",
+            whiteSpace:"nowrap"}} title={cat}>{cat}</span>
+        </div>
+        <span style={{textAlign:"center",fontSize:13,fontFamily:"'IBM Plex Mono',monospace",
+          fontWeight:600,color:"#374151"}}>{vals.total}</span>
+        <span style={{textAlign:"center",fontSize:13,fontFamily:"'IBM Plex Mono',monospace",
+          fontWeight:600,color:"#10b981"}}>{vals.released}</span>
+        <span style={{textAlign:"center",fontSize:13,fontFamily:"'IBM Plex Mono',monospace",
+          color:"#6366f1",fontWeight:600}}>{share}%</span>
+      </div>;
+    })}
+    {subtitle && <div style={{fontSize:11,color:"#94a3b8",marginTop:8}}>{subtitle}</div>}
+  </div>;
+}
+
+// ─── parsed info box ─────────────────────────────────────────────────────────
+function ParsedInfo({parsed, onLeadTimeChange, leadTimeVal}){
+  return <div style={{padding:"14px 16px",background:"#d1fae5",border:"1px solid #6ee7b7",
+    borderRadius:10,fontSize:13,marginBottom:12}}>
+    <div style={{fontWeight:600,color:"#065f46",marginBottom:10}}>✓ {parsed.fileName} — {parsed.planned} задач</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:6,marginBottom:6}}>
+      {[["Всего задач",parsed.planned],["В релизе",parsed.released],
+        ["Velocity",parsed.velocity],
+        ["Lead Time",parsed.leadTime!==null?parsed.leadTime+"д":"нет дат"],
+        ["Категорий",Object.keys(parsed.catMap).length]
+      ].map(([l,v])=><div key={l} style={{fontSize:12,color:"#065f46"}}>
+        <span style={{opacity:.7}}>{l}: </span>
+        <strong style={{fontFamily:"'IBM Plex Mono',monospace"}}>{v}</strong>
+      </div>)}
+    </div>
+    {!parsed.hasCat && <div style={{fontSize:12,color:"#854d0e",marginTop:4}}>⚠ Столбец «Категория» не найден</div>}
+    {!parsed.hasLeadTime && <div style={{marginTop:10}}>
+      <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>Lead Time не найден — введите вручную (дни)</div>
+      <input type="number" placeholder="11" value={leadTimeVal}
+        onChange={e=>onLeadTimeChange(e.target.value)} className="inp" style={{width:120}}/>
+    </div>}
+  </div>;
+}
+
+// ─── app ─────────────────────────────────────────────────────────────────────
+function App(){
+  const load=(key,def)=>{ try{ const d=localStorage.getItem(key); return d?JSON.parse(d):def; }catch{ return def; } };
+  const [releases, setReleases] = useState(()=>load("hrm_releases",INITIAL_RELEASES).map(computeRelease));
+  const [months,   setMonths]   = useState(()=>load("hrm_months",  INITIAL_MONTHS));
+  const [tab, setTab]           = useState("releases");
+  const [editing, setEditing]   = useState(null);
+
+  // release form
+  const [showRF, setShowRF]     = useState(false);
+  const [rfMode, setRfMode]     = useState("manual");
+  const [rfForm, setRfForm]     = useState({release:"",date:"",planned:"",released:"",leadTime:"",velocity:"",monthPlanned:"",monthId:""});
+  const [rfParsed, setRfParsed] = useState(null);
+  const [rfErr, setRfErr]       = useState("");
+
+  // month form
+  const [showMF, setShowMF]     = useState(false);
+  const [mfMode, setMfMode]     = useState("manual");
+  const [mfForm, setMfForm]     = useState({label:"",planned:""});
+  const [mfParsed, setMfParsed] = useState(null);
+  const [mfErr, setMfErr]       = useState("");
+
+  // selected month for detail view
+  const [selectedMonth, setSelectedMonth] = useState(null);
+
+  function saveReleases(next){ setReleases(next); try{localStorage.setItem("hrm_releases",JSON.stringify(next));}catch{} }
+  function saveMonths(next){   setMonths(next);   try{localStorage.setItem("hrm_months",  JSON.stringify(next));}catch{} }
+
+  function editCell(id,field,value){
+    saveReleases(releases.map(r=>{
+      if(r.id!==id) return r;
+      const nums=["planned","released","leadTime","velocity","monthPlanned"];
+      return computeRelease({...r,[field]:nums.includes(field)?(Number(value)||0):value});
+    }));
+  }
+  function deleteRelease(id){ saveReleases(releases.filter(r=>r.id!==id)); }
+  function deleteMonth(id){
+    saveMonths(months.filter(m=>m.id!==id));
+    saveReleases(releases.map(r=>r.monthId===id?{...r,monthId:null}:r));
+    if(selectedMonth===id) setSelectedMonth(null);
+  }
+
+  // release CSV upload
+  function handleReleaseFile(file){
+    setRfErr(""); setRfParsed(null);
+    readFile(file, text=>{
+      const res=parseRedmineCSV(text);
+      if(res.error){setRfErr(res.error);return;}
+      setRfParsed({...res,fileName:file.name});
+      setRfForm(f=>({...f,planned:String(res.planned),released:String(res.released),
+        velocity:String(res.velocity),leadTime:res.leadTime!==null?String(res.leadTime):""}));
+    });
+  }
+
+  // month CSV upload
+  function handleMonthFile(file){
+    setMfErr(""); setMfParsed(null);
+    readFile(file, text=>{
+      const res=parseRedmineCSV(text);
+      if(res.error){setMfErr(res.error);return;}
+      setMfParsed({...res,fileName:file.name});
+      setMfForm(f=>({...f,planned:String(res.planned)}));
+    });
+  }
+
+  function addRelease(){
+    const nr=computeRelease({id:Date.now(),
+      release:rfForm.release, date:rfForm.date,
+      planned:Number(rfForm.planned)||0, released:Number(rfForm.released)||0,
+      leadTime:rfForm.leadTime!==""?Number(rfForm.leadTime):null,
+      velocity:Number(rfForm.velocity)||0,
+      monthPlanned:Number(rfForm.monthPlanned)||0,
+      monthId:rfForm.monthId?Number(rfForm.monthId):null,
+      catMap:rfParsed?.catMap||{},
+    });
+    saveReleases([...releases,nr]);
+    setRfForm({release:"",date:"",planned:"",released:"",leadTime:"",velocity:"",monthPlanned:"",monthId:""});
+    setRfParsed(null); setRfErr(""); setShowRF(false);
+  }
+
+  function addMonth(){
+    const nm={id:Date.now(), label:mfForm.label,
+      planned:Number(mfForm.planned)||0,
+      catMap:mfParsed?.catMap||{}};
+    saveMonths([...months,nm]);
+    setMfForm({label:"",planned:""}); setMfParsed(null); setMfErr(""); setShowMF(false);
+  }
+
+  const seriesOf=key=>releases.map(r=>r[key]);
+  const avgOf=key=>{ const v=releases.map(r=>r[key]).filter(x=>x!==null&&x!==undefined);
+    return v.length?Math.round(v.reduce((s,x)=>s+x,0)/v.length):0; };
+  const latest=releases[releases.length-1];
+
+  // computed months
+  const computedMonths = useMemo(()=>months.map(m=>computeMonth(m,releases)),[months,releases]);
+
+  // global cat map across all releases
+  const globalCatMap = useMemo(()=>{
+    const g={};
+    releases.forEach(r=>{
+      if(!r.catMap) return;
+      Object.entries(r.catMap).forEach(([cat,v])=>{
+        if(!g[cat]) g[cat]={total:0,released:0};
+        g[cat].total+=v.total||0; g[cat].released+=v.released||0;
+      });
+    });
+    return g;
+  },[releases]);
+
+  const TABS=[["releases","Релизы"],["months","Месяцы"],["modules","Модули"],["guide","Инструкция"]];
+
+  return <div style={{fontFamily:"'IBM Plex Sans',sans-serif",background:"#f8fafc",minHeight:"100vh",paddingBottom:48}}>
+
+    {/* header */}
+    <div style={{background:"#0f172a",padding:"26px 32px 22px"}}>
+      <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+        <div>
+          <div style={{fontSize:10,letterSpacing:3,color:"#64748b",textTransform:"uppercase",marginBottom:6,
+            fontFamily:"'IBM Plex Mono',monospace"}}>Release Analytics</div>
+          <div style={{fontSize:24,fontWeight:700,color:"#f1f5f9",letterSpacing:-0.5}}>Метрики релизов</div>
+        </div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {TABS.map(([t,l])=><button key={t} onClick={()=>setTab(t)} style={{
+            padding:"7px 18px",borderRadius:8,border:"none",cursor:"pointer",fontSize:13,fontWeight:500,
+            background:tab===t?"#3b82f6":"#1e293b",color:tab===t?"#fff":"#94a3b8",transition:"all .15s"}}>{l}</button>)}
+        </div>
+      </div>
+    </div>
+
+    <div style={{padding:"24px 32px 0"}}>
+
+      {/* KPI cards — last release */}
+      {latest && tab==="releases" && <div style={{display:"grid",
+        gridTemplateColumns:"repeat(auto-fill,minmax(155px,1fr))",gap:12,marginBottom:24}}>
+        {RELEASE_METRICS.map(({key,label,suffix,hint})=>{
+          const val=latest[key]; const s=getStatus(val,key); const c=SC[s];
+          return <div key={key} style={{background:"#fff",borderRadius:12,padding:"14px 16px",
+            border:`1.5px solid ${c.border}`,boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:6,lineHeight:1.35}}>{label}</div>
+            <div style={{fontSize:22,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",color:c.text}}>
+              {val!==null&&val!==undefined?`${val}${suffix}`:"—"}</div>
+            <div style={{margin:"6px 0 2px"}}><Sparkline values={seriesOf(key)} metricKey={key}/></div>
+            <div style={{fontSize:10,color:"#94a3b8"}}>цель {hint}</div>
+          </div>;
+        })}
+      </div>}
+
+      {/* ══ RELEASES ══ */}
+      {tab==="releases" && <>
+        <div style={{background:"#fff",borderRadius:14,border:"1px solid #e2e8f0",overflow:"hidden",marginBottom:16}}>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+              <thead><tr style={{background:"#f1f5f9"}}>
+                {["Релиз","Дата","Месяц"].map(h=><th key={h} style={{padding:"11px 14px",textAlign:"left",
+                  fontWeight:600,color:"#475569",whiteSpace:"nowrap",borderBottom:"1px solid #e2e8f0"}}>{h}</th>)}
+                {RELEASE_METRICS.map(({key,label,hint})=><th key={key} style={{padding:"11px 10px",
+                  textAlign:"center",fontWeight:600,color:"#475569",whiteSpace:"nowrap",
+                  borderBottom:"1px solid #e2e8f0",minWidth:110}}>
+                  {label}<span style={{fontSize:10,color:"#94a3b8",display:"block",fontWeight:400}}>{hint}</span>
+                </th>)}
+                <th style={{padding:"11px 10px",textAlign:"center",fontWeight:600,color:"#475569",
+                  fontSize:12,borderBottom:"1px solid #e2e8f0"}}>Задачи релиза</th>
+                <th style={{borderBottom:"1px solid #e2e8f0",width:90}}/>
+              </tr></thead>
+              <tbody>
+                {releases.map((r,idx)=>{
+                  const linkedMonth=months.find(m=>m.id===r.monthId);
+                  return <tr key={r.id} style={{background:idx%2===0?"#fff":"#f8fafc"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="#eff6ff"}
+                    onMouseLeave={e=>e.currentTarget.style.background=idx%2===0?"#fff":"#f8fafc"}>
+                    <td style={{padding:"9px 14px",fontFamily:"'IBM Plex Mono',monospace",fontWeight:600,
+                      color:"#1e40af",whiteSpace:"nowrap",borderBottom:"1px solid #f1f5f9"}}>
+                      {editing===r.id?<input value={r.release} onChange={e=>editCell(r.id,"release",e.target.value)}
+                        className="inp" style={{width:110}}/>:r.release}
+                    </td>
+                    <td style={{padding:"9px 10px",color:"#64748b",borderBottom:"1px solid #f1f5f9",whiteSpace:"nowrap"}}>
+                      {editing===r.id?<input type="date" value={r.date} onChange={e=>editCell(r.id,"date",e.target.value)}
+                        className="inp" style={{width:130}}/>:r.date}
+                    </td>
+                    <td style={{padding:"9px 10px",borderBottom:"1px solid #f1f5f9"}}>
+                      {editing===r.id
+                        ?<select value={r.monthId||""} onChange={e=>editCell(r.id,"monthId",e.target.value||null)}
+                          className="inp" style={{width:130}}>
+                          <option value="">—</option>
+                          {months.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}
+                        </select>
+                        :<span style={{fontSize:12,color:linkedMonth?"#6366f1":"#cbd5e1"}}>
+                          {linkedMonth?linkedMonth.label:"—"}
+                        </span>}
+                    </td>
+                    {RELEASE_METRICS.map(({key,suffix})=>{
+                      const auto=key==="conversion"||key==="monthToRelease";
+                      return <td key={key} style={{padding:"9px 10px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                        {editing===r.id&&!auto
+                          ?<input type="number" value={r[key]??""} onChange={e=>editCell(r.id,key,e.target.value)}
+                            className="inp" style={{width:58,textAlign:"center"}}/>
+                          :<Badge val={r[key]} metricKey={key} suffix={suffix}/>}
+                      </td>;
+                    })}
+                    <td style={{padding:"9px 10px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                      {r.catMap&&Object.keys(r.catMap).length>0
+                        ?<span style={{fontSize:12,color:"#10b981",fontWeight:500}}>📄 {Object.values(r.catMap).reduce((s,v)=>s+v.total,0)}</span>
+                        :<span style={{fontSize:12,color:"#cbd5e1"}}>—</span>}
+                    </td>
+                    <td style={{padding:"9px 10px",borderBottom:"1px solid #f1f5f9",whiteSpace:"nowrap"}}>
+                      <button onClick={()=>setEditing(editing===r.id?null:r.id)} style={{marginRight:5,
+                        padding:"3px 10px",borderRadius:6,fontSize:12,cursor:"pointer",
+                        border:"1px solid #cbd5e1",background:editing===r.id?"#3b82f6":"#fff",
+                        color:editing===r.id?"#fff":"#475569"}}>{editing===r.id?"✓":"✎"}</button>
+                      <button onClick={()=>deleteRelease(r.id)} style={{padding:"3px 9px",borderRadius:6,
+                        fontSize:12,cursor:"pointer",border:"1px solid #fca5a5",background:"#fff",color:"#dc2626"}}>✕</button>
+                    </td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* add release form */}
+        {!showRF
+          ?<button onClick={()=>setShowRF(true)} style={{width:"100%",padding:11,borderRadius:10,
+            border:"2px dashed #cbd5e1",background:"#fff",color:"#64748b",cursor:"pointer",fontSize:13,fontWeight:500}}>
+            + Добавить релиз
+          </button>
+          :<div style={{background:"#fff",borderRadius:14,border:"1px solid #93c5fd",padding:24,marginBottom:8}}>
+            <div style={{fontSize:15,fontWeight:700,color:"#1e40af",marginBottom:16}}>Новый релиз</div>
+            <div style={{display:"flex",gap:8,marginBottom:20}}>
+              {[["manual","Ввести вручную"],["file","Загрузить CSV"]].map(([m,l])=>
+                <button key={m} onClick={()=>{setRfMode(m);setRfParsed(null);setRfErr("");}} style={{
+                  padding:"8px 18px",borderRadius:8,border:`1.5px solid ${rfMode===m?"#3b82f6":"#e2e8f0"}`,
+                  background:rfMode===m?"#eff6ff":"#fff",color:rfMode===m?"#1e40af":"#64748b",
+                  cursor:"pointer",fontSize:13,fontWeight:rfMode===m?600:400}}>{l}</button>)}
+            </div>
+
+            {/* common fields */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:12,marginBottom:16}}>
+              {[{k:"release",l:"Версия релиза",t:"text",ph:"v20.03.2026"},
+                {k:"date",l:"Дата релиза",t:"date",ph:""},
+                {k:"monthPlanned",l:"Задач в месяце",t:"number",ph:"68"},
+              ].map(({k,l,t,ph})=><div key={k}>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{l}</div>
+                <input type={t} placeholder={ph} value={rfForm[k]}
+                  onChange={e=>setRfForm(f=>({...f,[k]:e.target.value}))} className="inp"/>
+              </div>)}
+              <div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>Привязать к месяцу</div>
+                <select value={rfForm.monthId||""} onChange={e=>setRfForm(f=>({...f,monthId:e.target.value}))}
+                  className="inp">
+                  <option value="">— не привязан —</option>
+                  {months.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}
+                </select>
+              </div>
+            </div>
+
+            {rfMode==="manual" && <div style={{display:"grid",
+              gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:12,marginBottom:16}}>
+              {[{k:"planned",l:"Запланировано задач",ph:"12"},
+                {k:"released",l:"Выпущено задач",ph:"9"},
+                {k:"velocity",l:"Velocity",ph:"9"},
+                {k:"leadTime",l:"Lead Time (средний, дни)",ph:"11"},
+              ].map(({k,l,ph})=><div key={k}>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{l}</div>
+                <input type="number" placeholder={ph} value={rfForm[k]}
+                  onChange={e=>setRfForm(f=>({...f,[k]:e.target.value}))} className="inp"/>
+              </div>)}
+            </div>}
+
+            {rfMode==="file" && <>
+              <DropZone onFile={handleReleaseFile}
+                label="CSV-файл задач релиза (Статус, Категория, Дата начала, Дата релиза)"/>
+              {rfErr&&<div style={{padding:"10px 14px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:8,fontSize:13,color:"#991b1b",marginBottom:12}}>⚠ {rfErr}</div>}
+              {rfParsed&&<ParsedInfo parsed={rfParsed}
+                leadTimeVal={rfForm.leadTime}
+                onLeadTimeChange={v=>setRfForm(f=>({...f,leadTime:v}))}/>}
+            </>}
+
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <button onClick={addRelease} disabled={!rfForm.release} style={{
+                padding:"9px 24px",borderRadius:8,border:"none",
+                background:rfForm.release?"#3b82f6":"#cbd5e1",
+                color:"#fff",cursor:rfForm.release?"pointer":"default",fontSize:13,fontWeight:600}}>
+                Сохранить релиз
+              </button>
+              <button onClick={()=>{setShowRF(false);setRfParsed(null);setRfErr("");}} style={{
+                padding:"9px 18px",borderRadius:8,border:"1px solid #cbd5e1",
+                background:"#fff",color:"#475569",cursor:"pointer",fontSize:13}}>Отмена</button>
+            </div>
+          </div>}
+      </>}
+
+      {/* ══ MONTHS ══ */}
+      {tab==="months" && <>
+        {/* month list */}
+        {computedMonths.length===0&&<div style={{background:"#fff",borderRadius:14,padding:32,
+          textAlign:"center",border:"1px solid #e2e8f0",color:"#94a3b8",marginBottom:16}}>
+          <div style={{fontSize:28,marginBottom:8}}>📅</div>
+          <div style={{fontSize:14,fontWeight:600,color:"#64748b",marginBottom:4}}>Нет месяцев</div>
+          <div style={{fontSize:13}}>Добавьте месяц и привяжите к нему релизы</div>
+        </div>}
+
+        {selectedMonth===null
+          ? computedMonths.map(m=><div key={m.id} style={{background:"#fff",borderRadius:14,
+              border:"1px solid #e2e8f0",marginBottom:16,overflow:"hidden"}}>
+              {/* month header */}
+              <div style={{padding:"16px 20px",background:"#0f172a",
+                display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                <div>
+                  <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{m.label}</div>
+                  <div style={{fontSize:12,color:"#64748b",marginTop:2}}>
+                    Запланировано: {m.planned} задач · Релизов: {m.releases.length}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={()=>setSelectedMonth(m.id)} style={{padding:"6px 14px",
+                    borderRadius:8,border:"none",background:"#3b82f6",color:"#fff",
+                    cursor:"pointer",fontSize:12,fontWeight:500}}>Подробнее →</button>
+                  <button onClick={()=>deleteMonth(m.id)} style={{padding:"6px 10px",
+                    borderRadius:8,border:"1px solid #fca5a5",background:"transparent",
+                    color:"#fca5a5",cursor:"pointer",fontSize:12}}>✕</button>
+                </div>
+              </div>
+              {/* month kpi */}
+              <div style={{padding:"16px 20px",display:"grid",
+                gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:12}}>
+                {[
+                  {k:"monthConv",     l:"Конверсия",    v:m.monthConv,     s:"%"},
+                  {k:"monthLeadTime", l:"Lead Time",    v:m.monthLeadTime, s:"д"},
+                  {k:"monthVelocity", l:"Выпущено",     v:m.monthVelocity, s:""},
+                  {k:"monthCoverage", l:"Охват бэклога",v:m.monthCoverage, s:"%"},
+                ].map(({k,l,v,s})=>{
+                  const st=getStatus(v,k); const c=SC[st];
+                  return <div key={k} style={{background:c.bg,borderRadius:10,padding:"12px 14px",
+                    border:`1px solid ${c.border}`}}>
+                    <div style={{fontSize:11,color:c.text,marginBottom:4,opacity:.8}}>{l}</div>
+                    <div style={{fontSize:20,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",color:c.text}}>
+                      {v!==null&&v!==undefined?`${v}${s}`:"—"}
+                    </div>
+                  </div>;
+                })}
+              </div>
+              {/* linked releases list */}
+              {m.releases.length>0&&<div style={{padding:"0 20px 16px"}}>
+                <div style={{fontSize:12,color:"#64748b",marginBottom:8,fontWeight:500}}>Релизы в этом месяце:</div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  {m.releases.map(r=><span key={r.id} style={{fontSize:12,padding:"3px 10px",
+                    borderRadius:6,background:"#eff6ff",color:"#1e40af",
+                    fontFamily:"'IBM Plex Mono',monospace",fontWeight:600}}>{r.release}</span>)}
+                </div>
+              </div>}
+            </div>)
+          : (() => {
+              const m = computedMonths.find(x=>x.id===selectedMonth);
+              if(!m) return null;
+              return <div>
+                <button onClick={()=>setSelectedMonth(null)} style={{padding:"7px 16px",borderRadius:8,
+                  border:"1px solid #cbd5e1",background:"#fff",color:"#475569",cursor:"pointer",
+                  fontSize:13,marginBottom:16}}>← Назад к месяцам</button>
+
+                <div style={{background:"#fff",borderRadius:14,border:"1px solid #e2e8f0",marginBottom:16}}>
+                  <div style={{padding:"16px 20px",borderBottom:"1px solid #e2e8f0"}}>
+                    <div style={{fontSize:16,fontWeight:700,color:"#0f172a"}}>{m.label}</div>
+                    <div style={{fontSize:13,color:"#64748b",marginTop:2}}>
+                      {m.planned} запланировано · {m.totalReleased} выпущено · {m.releases.length} релизов
+                    </div>
+                  </div>
+
+                  {/* per-release table inside month */}
+                  <div style={{padding:"16px 20px"}}>
+                    <div style={{fontSize:14,fontWeight:600,color:"#0f172a",marginBottom:12}}>Релизы месяца</div>
+                    <div style={{overflowX:"auto"}}>
+                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                        <thead><tr style={{background:"#f1f5f9"}}>
+                          {["Релиз","Дата","Конверсия","Lead Time","Velocity","Задачи"].map(h=>
+                            <th key={h} style={{padding:"9px 12px",textAlign:h==="Релиз"||h==="Дата"?"left":"center",
+                              fontWeight:600,color:"#475569",whiteSpace:"nowrap",borderBottom:"1px solid #e2e8f0"}}>{h}</th>)}
+                        </tr></thead>
+                        <tbody>
+                          {m.releases.map((r,idx)=><tr key={r.id} style={{background:idx%2===0?"#fff":"#f8fafc"}}>
+                            <td style={{padding:"8px 12px",fontFamily:"'IBM Plex Mono',monospace",fontWeight:600,
+                              color:"#1e40af",borderBottom:"1px solid #f1f5f9"}}>{r.release}</td>
+                            <td style={{padding:"8px 12px",color:"#64748b",borderBottom:"1px solid #f1f5f9"}}>{r.date}</td>
+                            <td style={{padding:"8px 12px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                              <Badge val={r.conversion} metricKey="conversion" suffix="%"/></td>
+                            <td style={{padding:"8px 12px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                              <Badge val={r.leadTime} metricKey="leadTime" suffix="д"/></td>
+                            <td style={{padding:"8px 12px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                              <Badge val={r.velocity} metricKey="velocity" suffix=""/></td>
+                            <td style={{padding:"8px 12px",textAlign:"center",borderBottom:"1px solid #f1f5f9"}}>
+                              {r.catMap&&Object.keys(r.catMap).length>0
+                                ?<span style={{fontSize:12,color:"#10b981",fontWeight:500}}>
+                                  📄 {Object.values(r.catMap).reduce((s,v)=>s+v.total,0)}</span>
+                                :<span style={{color:"#cbd5e1"}}>—</span>}
+                            </td>
+                          </tr>)}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* month module breakdown */}
+                  {Object.keys(m.catMap).length>0&&<div style={{padding:"0 20px 20px"}}>
+                    <div style={{fontSize:14,fontWeight:600,color:"#0f172a",marginBottom:12}}>Модули месяца</div>
+                    <ModulesPanel catMap={m.catMap}/>
+                  </div>}
+                </div>
+              </div>;
+            })()}
+
+        {/* add month form */}
+        {!showMF
+          ?<button onClick={()=>setShowMF(true)} style={{width:"100%",padding:11,borderRadius:10,
+            border:"2px dashed #cbd5e1",background:"#fff",color:"#64748b",cursor:"pointer",fontSize:13,fontWeight:500}}>
+            + Добавить месяц
+          </button>
+          :<div style={{background:"#fff",borderRadius:14,border:"1px solid #93c5fd",padding:24,marginBottom:8}}>
+            <div style={{fontSize:15,fontWeight:700,color:"#1e40af",marginBottom:16}}>Новый месяц</div>
+            <div style={{display:"flex",gap:8,marginBottom:20}}>
+              {[["manual","Ввести вручную"],["file","Загрузить CSV бэклога"]].map(([m,l])=>
+                <button key={m} onClick={()=>{setMfMode(m);setMfParsed(null);setMfErr("");}} style={{
+                  padding:"8px 18px",borderRadius:8,border:`1.5px solid ${mfMode===m?"#3b82f6":"#e2e8f0"}`,
+                  background:mfMode===m?"#eff6ff":"#fff",color:mfMode===m?"#1e40af":"#64748b",
+                  cursor:"pointer",fontSize:13,fontWeight:mfMode===m?600:400}}>{l}</button>)}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:12,marginBottom:16}}>
+              <div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>Название месяца</div>
+                <input placeholder="Март 2026" value={mfForm.label}
+                  onChange={e=>setMfForm(f=>({...f,label:e.target.value}))} className="inp"/>
+              </div>
+              <div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>Задач запланировано</div>
+                <input type="number" placeholder="68" value={mfForm.planned}
+                  onChange={e=>setMfForm(f=>({...f,planned:e.target.value}))} className="inp"/>
+              </div>
+            </div>
+            {mfMode==="file"&&<>
+              <DropZone onFile={handleMonthFile}
+                label="CSV бэклога месяца (Статус, Категория)"/>
+              {mfErr&&<div style={{padding:"10px 14px",background:"#fee2e2",border:"1px solid #fca5a5",
+                borderRadius:8,fontSize:13,color:"#991b1b",marginBottom:12}}>⚠ {mfErr}</div>}
+              {mfParsed&&<ParsedInfo parsed={mfParsed}
+                leadTimeVal="" onLeadTimeChange={()=>{}}/>}
+            </>}
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={addMonth} disabled={!mfForm.label} style={{
+                padding:"9px 24px",borderRadius:8,border:"none",
+                background:mfForm.label?"#3b82f6":"#cbd5e1",
+                color:"#fff",cursor:mfForm.label?"pointer":"default",fontSize:13,fontWeight:600}}>
+                Сохранить месяц
+              </button>
+              <button onClick={()=>{setShowMF(false);setMfParsed(null);setMfErr("");}} style={{
+                padding:"9px 18px",borderRadius:8,border:"1px solid #cbd5e1",
+                background:"#fff",color:"#475569",cursor:"pointer",fontSize:13}}>Отмена</button>
+            </div>
+          </div>}
+      </>}
+
+      {/* ══ MODULES ══ */}
+      {tab==="modules" && <div>
+        {Object.keys(globalCatMap).length===0
+          ?<div style={{background:"#fff",borderRadius:14,padding:32,textAlign:"center",
+            border:"1px solid #e2e8f0",color:"#94a3b8"}}>
+            <div style={{fontSize:32,marginBottom:12}}>📂</div>
+            <div style={{fontSize:14,fontWeight:600,color:"#64748b",marginBottom:4}}>Нет данных по модулям</div>
+            <div style={{fontSize:13}}>Загрузите CSV при добавлении релиза — нужен столбец «Категория»</div>
+          </div>
+          :<>
+            <div style={{background:"#fff",borderRadius:14,padding:24,border:"1px solid #e2e8f0",marginBottom:20}}>
+              <div style={{fontSize:15,fontWeight:700,color:"#0f172a",marginBottom:4}}>Сводка по всем релизам</div>
+              <div style={{fontSize:13,color:"#64748b",marginBottom:16}}>
+                % от всех — доля задач модуля от общего числа задач по всем релизам
+              </div>
+              <ModulesPanel catMap={globalCatMap}/>
+            </div>
+
+            {/* per-release module cards */}
+            {releases.filter(r=>r.catMap&&Object.keys(r.catMap).length>0).length>0&&
+              <div style={{background:"#fff",borderRadius:14,padding:24,border:"1px solid #e2e8f0"}}>
+                <div style={{fontSize:15,fontWeight:700,color:"#0f172a",marginBottom:16}}>По каждому релизу</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(340px,1fr))",gap:16}}>
+                  {releases.filter(r=>r.catMap&&Object.keys(r.catMap).length>0).map(r=>
+                    <div key={r.id} style={{border:"1px solid #e2e8f0",borderRadius:12,overflow:"hidden"}}>
+                      <div style={{padding:"10px 14px",background:"#f8fafc",borderBottom:"1px solid #e2e8f0",
+                        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <span style={{fontFamily:"'IBM Plex Mono',monospace",fontWeight:600,
+                          color:"#1e40af",fontSize:13}}>{r.release}</span>
+                        <span style={{fontSize:12,color:"#64748b"}}>{r.date}</span>
+                      </div>
+                      <div style={{padding:"12px 14px"}}>
+                        <ModulesPanel catMap={r.catMap}/>
+                      </div>
+                    </div>)}
+                </div>
+              </div>}
+          </>}
+      </div>}
+
+      {/* ══ GUIDE ══ */}
+      {tab==="guide" && <div style={{background:"#fff",borderRadius:14,padding:28,
+        border:"1px solid #e2e8f0",maxWidth:820}}>
+        <div style={{fontSize:16,fontWeight:700,color:"#0f172a",marginBottom:24}}>Инструкция</div>
+
+        {/* metric descriptions */}
+        <div style={{marginBottom:28}}>
+          <div style={{fontSize:14,fontWeight:600,color:"#1e40af",marginBottom:14}}>📊 Что означает каждая метрика</div>
+          {[
+            {
+              name:"Конверсия план→релиз",hint:"цель 70–90%",
+              desc:"Доля задач из недельного плана, которые реально вошли в релиз.",
+              formula:"Выпущено / Запланировано × 100%",
+              why:"Показывает точность планирования спринта. Ниже 70% — план завышен или задачи не готовы к разработке. Выше 90% — хороший знак, но следите за качеством."
+            },
+            {
+              name:"Lead Time",hint:"цель < 14 дней",
+              desc:"Среднее время от создания задачи до её попадания в релиз.",
+              formula:"Дата релиза − Дата начала (среднее по задачам в релизе)",
+              why:"Показывает скорость доставки. Чем меньше — тем быстрее команда реагирует на запросы клиентов. Высокий Lead Time часто говорит о застрявших задачах в бэклоге."
+            },
+            {
+              name:"Velocity",hint:"цель 5–15 задач",
+              desc:"Количество задач, выпущенных в одном релизе.",
+              formula:"Количество задач со статусом «Релиз» или «Принята»",
+              why:"Показывает пропускную способность команды. Стабильная Velocity — признак предсказуемого процесса. Резкие скачки вниз — сигнал: отпуска, сложные задачи, технические проблемы."
+            },
+            {
+              name:"Месяц→Релиз",hint:"цель 50–70%",
+              desc:"Доля задач из месячного плана, которая вошла в конкретный недельный релиз.",
+              formula:"Выпущено в релизе / Задач запланировано на месяц × 100%",
+              why:"Один месяц = несколько релизов, поэтому 20–30% на релиз — норма. Если сложить все релизы месяца — суммарно должно получиться 50–70% от месячного плана (остаток переносится или отменяется)."
+            },
+          ].map(({name,hint,desc,formula,why})=>
+            <div key={name} style={{marginBottom:16,padding:"14px 16px",background:"#f8fafc",
+              borderRadius:10,borderLeft:"3px solid #3b82f6"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6,gap:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:14,fontWeight:600,color:"#1e293b"}}>{name}</span>
+                <span style={{fontSize:11,color:"#6366f1",fontFamily:"'IBM Plex Mono',monospace",
+                  background:"#eff6ff",padding:"2px 8px",borderRadius:10}}>{hint}</span>
+              </div>
+              <div style={{fontSize:13,color:"#374151",marginBottom:6}}>{desc}</div>
+              <div style={{fontSize:12,color:"#6366f1",fontFamily:"'IBM Plex Mono',monospace",
+                background:"#fff",padding:"4px 10px",borderRadius:6,marginBottom:6,
+                border:"1px solid #e0e7ff"}}>{formula}</div>
+              <div style={{fontSize:12,color:"#64748b",lineHeight:1.5}}>{why}</div>
+            </div>)}
+        </div>
+
+        {[
+          {icon:"📂",title:"Как подготовить CSV из Redmine",items:[
+            "Откройте список задач, примените фильтр по версии релиза",
+            "Убедитесь, что в таблице есть: Статус, Категория, Дата начала, Дата релиза",
+            "Нажмите «Экспорт» → CSV (разделитель ; UTF-8)",
+            "Статус «Релиз» или «Принята» — задача вошла в релиз",
+            "Все прочие статусы (Готово к релизу, На ревью и др.) — задача не вошла",
+          ]},
+          {icon:"📅",title:"Как работать с месяцами",items:[
+            "Создайте месяц в разделе «Месяцы» — укажите название и количество задач в бэклоге",
+            "Можно загрузить CSV бэклога месяца — тогда будет аналитика по модулям на уровне месяца",
+            "При добавлении релиза выберите «Привязать к месяцу» — релиз войдёт в сводку месяца",
+            "В разделе «Месяцы» → «Подробнее» видите все релизы месяца и разбивку по модулям",
+          ]},
+          {icon:"➕",title:"Как добавить релиз",items:[
+            "Нажмите «+ Добавить релиз» в разделе «Релизы»",
+            "Версия релиза в формате v20.03.2026",
+            "Выберите: «Ввести вручную» или «Загрузить CSV» — при загрузке всё считается автоматически",
+            "Привяжите релиз к месяцу — для расчёта месячной аналитики",
+          ]},
+        ].map(({icon,title,items})=>
+          <div key={title} style={{marginBottom:24}}>
+            <div style={{fontSize:14,fontWeight:600,color:"#1e40af",marginBottom:10}}>{icon} {title}</div>
+            <div style={{paddingLeft:16}}>
+              {items.map((item,i)=><div key={i} style={{fontSize:13,color:"#475569",padding:"5px 0",
+                borderBottom:"1px solid #f1f5f9",lineHeight:1.5}}>{item}</div>)}
+            </div>
+          </div>)}
+      </div>}
+
+      <div style={{marginTop:20,fontSize:12,color:"#94a3b8",display:"flex",gap:16,flexWrap:"wrap"}}>
+        <span>Данные сохраняются в localStorage</span>
+        <span>·</span>
+        <span>Конверсия и Месяц→Релиз считаются автоматически</span>
+        <span>·</span>
+        <span>✎ — редактировать · ✕ — удалить</span>
+      </div>
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
