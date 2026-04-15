@@ -24,7 +24,7 @@ input[type=number]::-webkit-inner-spin-button{opacity:.5;}
 <body>
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
-const { useState, useMemo, useRef } = React;
+const { useState, useMemo, useRef, useEffect } = React;
 
 // ─── constants ────────────────────────────────────────────────────────────────
 const RELEASED_STATUSES = ["релиз", "принята"];
@@ -332,6 +332,9 @@ function App(){
 
   // selected month for detail view
   const [selectedMonth, setSelectedMonth] = useState(null);
+
+  useEffect(()=>{ try{localStorage.setItem("hrm_releases",JSON.stringify(releases));}catch{} },[releases]);
+  useEffect(()=>{ try{localStorage.setItem("hrm_months",  JSON.stringify(months));  }catch{} },[months]);
 
   function saveReleases(next){ setReleases(next); try{localStorage.setItem("hrm_releases",JSON.stringify(next));}catch{} }
   function saveMonths(next){   setMonths(next);   try{localStorage.setItem("hrm_months",  JSON.stringify(next));}catch{} }
